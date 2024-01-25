@@ -2,8 +2,7 @@
   #?(:cljs (:require-macros com.fulcrologic.guardrails.malli.core))
   (:require
     [com.fulcrologic.guardrails.malli.registry :as gr.reg :refer [register!]]
-    #?@(:clj [[clojure.spec.alpha :as s]
-              [clojure.string :as string]
+    #?@(:clj [[clojure.string :as string]
               [com.fulcrologic.guardrails.config :as gr.cfg]
               [com.fulcrologic.guardrails.impl.pro :as gr.pro]
               [com.fulcrologic.guardrails.utils :as utils]
@@ -86,9 +85,34 @@
 ;;; Debounced clj-kondo config emission
 
 #?(:clj
+   (defn -register-function-schema!
+     [ns name ?schema data]
+     (m/-register-function-schema! ns name ?schema data :clj
+       (fn [s] (m/function-schema s {:registry gr.reg/registry})))))
+
+#?(:clj
+   (defn -collect! [v]
+     (let [{:keys [ns name] :as m} (meta v)]
+       (when-let [s (mi/-schema v)]
+         (-register-function-schema! (-> ns str symbol) name s (m/-unlift-keys m "malli"))))))
+
+#?(:clj
+   (defn clj-collect!
+     ([] (clj-collect! {:ns *ns*}))
+     ([{:keys [ns]}]
+      (not-empty (reduce (fn [acc v]
+                           (let [v (-collect! v)]
+                             (cond-> acc v (conj v))))
+                   #{}
+                   (vals (mapcat (fn [x]
+                                   (println x)
+                                   (some-> x (ns-publics)))
+                           (mi/-sequential ns))))))))
+
+#?(:clj
    (let [!linter-emit-future     (volatile! nil)
          !linter-emit-namespaces (volatile! #{})
-         linter-emit-debounce    2000]
+         linter-emit-debounce    1000]
      (defmacro bump-linter-cfg-emit! [nspace]
        (when-let [futr @!linter-emit-future]
          (future-cancel futr))
@@ -98,8 +122,13 @@
            (Thread/sleep linter-emit-debounce)
            (utils/report-info "Emitting clj-kondo config...")
            (doseq [nspace @!linter-emit-namespaces]
-             (utils/report-info nspace)
-             (mi/collect! {:ns nspace}))
+             (try
+               (utils/report-info nspace)
+               (clj-collect! {:ns nspace})
+               #_(mi/collect! {:ns nspace})
+               (catch Throwable t
+                 (.printStackTrace t)
+                 (println "Error emitting." (ex-message t)))))
            (-> (mc/collect) mc/linter-config mc/save!)
            (utils/report-info "...DONE.")))
        nil)))
@@ -132,10 +161,10 @@
        {:arglists '([name doc-string? attr-map? [params*] gspec prepost-map? body?]
                     [name doc-string? attr-map? ([params*] gspec prepost-map? body?) + attr-map?])}
        [& forms]
-       (let [env (merge &env `{:guardrails/validate-fn validate
-                               :guardrails/explain-fn  explain
-                               :guardrails/humanize-fn humanize-schema
-                               :guardrails/pre-proc    (bump-linter-cfg-emit! ~(utils/get-ns-name &env))})]
+       (let [env (merge &env `{:guardrails/validate-fn  validate
+                               :guardrails/explain-fn   explain
+                               :guardrails/humanize-fn  humanize-schema
+                               :guardrails/clj-pre-proc (bump-linter-cfg-emit! ~(utils/get-ns-name &env))})]
          (gr.core/>defn* env &form forms {:private? false :guardrails/malli? true})))
      (s/fdef >defn :args ::gr.core/>defn-args)))
 
@@ -148,10 +177,10 @@
        {:arglists '([name doc-string? attr-map? [params*] gspec prepost-map? body?]
                     [name doc-string? attr-map? ([params*] gspec prepost-map? body?) + attr-map?])}
        [& forms]
-       (let [env (merge &env `{:guardrails/validate-fn validate
-                               :guardrails/explain-fn  explain
-                               :guardrails/humanize-fn humanize-schema
-                               :guardrails/pre-proc    (bump-linter-cfg-emit! ~(utils/get-ns-name &env))})]
+       (let [env (merge &env `{:guardrails/validate-fn  validate
+                               :guardrails/explain-fn   explain
+                               :guardrails/humanize-fn  humanize-schema
+                               :guardrails/clj-pre-proc (bump-linter-cfg-emit! ~(utils/get-ns-name &env))})]
          (gr.core/>defn* env &form forms {:private? true :guardrails/malli? true})))
      (s/fdef >defn- :args ::gr.core/>defn-args)))
 
@@ -173,4 +202,3 @@
                  (cljs-env? &env) clj->cljs)))))
 
      (s/fdef >fdef :args ::gr.core/>fdef-args)))
-

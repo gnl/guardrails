@@ -887,7 +887,7 @@
            arity               (key conformed-fn-tails)
            fn-name             (:name conformed-gdefn)
            docstring           (:docstring conformed-gdefn)
-           {:guardrails/keys [malli? pre-proc]} env
+           {:guardrails/keys [malli? clj-pre-proc]} env
            raw-meta-map        (merge
                                  (:meta conformed-gdefn)
                                  {::guardrails true})
@@ -937,7 +937,7 @@
           ~@(remove nil?
               [fdef
                `(declare ~fn-name)
-               (when-not (cljs-env? env) pre-proc)
+               (when-not (cljs-env? env) clj-pre-proc)
                main-defn])))))
 
 #?(:clj
