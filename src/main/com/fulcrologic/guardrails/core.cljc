@@ -31,20 +31,20 @@
 (def | :st)
 (def <- :gen)
 
-(def ^:private global-context (atom (list)))
+(defonce ^:private !global-context (atom (list)))
 
 (defn enter-global-context!
   "Push a global context, accessible from all threads, onto a stack. Used to add
   information to what guardrails will report when a function failed a check."
   [ctx]
-  (swap! global-context (partial cons ctx)))
+  (swap! !global-context (partial cons ctx)))
 
 (defn leave-global-context!
   "Pops a global context (see `enter-global-context!`). Should be passed the
   same context that was pushed, although is not enforced, as it's only to be
   easily compatible with fulcro-spec's hooks API."
   [ctx]
-  (swap! global-context rest))
+  (swap! !global-context rest))
 
 #?(:clj
    (defmacro with-global-context
@@ -52,12 +52,13 @@
       Will always call leave as it uses a try finally block.
       See `enter-global-context!`."
      [ctx & body]
-     `(do (enter-global-context! ~ctx)
-          (try ~@body
-               (finally
-                 (leave-global-context! ~ctx))))))
+     `(do
+        (enter-global-context! ~ctx)
+        (try ~@body
+          (finally
+            (leave-global-context! ~ctx))))))
 
-(defn- get-global-context [] (first @global-context))
+(defn- get-global-context [] (first @!global-context))
 
 
 (defonce pending-check-channel (async/chan (async/dropping-buffer 10000)))
@@ -87,12 +88,12 @@
 
 (def tap (resolve 'tap>))
 
-(defn humanize-spec [explain-data {:guardrails/keys [expound-options]}]
+(defn humanize-spec [explain-data expound-options]
   (with-out-str
     ((exp/custom-printer expound-options) explain-data)))
 
 (defn run-check [{:guardrails/keys [malli? validate-fn explain-fn humanize-fn]
-                  :keys            [tap>? args? vararg? expound-opts callsite throw? fn-name]}
+                  :keys            [tap>? args? vararg? humanize-opts callsite throw? fn-name]}
                  spec
                  value]
   (let [start           (now-ms)
@@ -111,7 +112,7 @@
     (try
       (when-not (validate-fn spec specable-args)
         (let [explain-data  (explain-fn spec specable-args)
-              explain-human (humanize-fn explain-data {:guardrails/expound-options expound-opts})
+              explain-human (humanize-fn explain-data humanize-opts)
               description   (str
                               "\n"
                               fn-name
@@ -480,7 +481,7 @@
                (if malli?
                  (if (or external-consumption? anon-fspec?)
                    (vec (concat
-                          [:function]
+                          (when-not multi-arity-args? [:function])
                           [[:=> processed-args (extract-spec retspec)]]))
                    (let [ret (extract-spec retspec)]
                      {:args processed-args
@@ -599,7 +600,7 @@
          (when (some :gspec (val conformed-fn-tail-or-tails))
            (if malli?
              (let [fspecs (map (partial get-fspecs true) (val conformed-fn-tail-or-tails))]
-               (mapcat second fspecs))
+               `[:function ~@(mapcat second fspecs)])
              (let [fspecs           (map (partial get-fspecs false) (val conformed-fn-tail-or-tails))
                    arg-specs        (mapcat (fn [[arity spec]]
                                               [arity (or (get-spec-part :args spec) `empty?)])
@@ -814,13 +815,14 @@
            where           (str file ":" line " " fn-name "'s")
            argspec         (gensym "argspec")
            nspc            (if cljs? (-> env :ns :name str) (name (ns-name *ns*)))
-           expound-opts    (get (gr.cfg/get-env-config) :expound {})
            opts            {:fn-name                where
                             :guardrails/malli?      malli?
                             :tap>?                  tap>?
                             :throw?                 throw?
                             :vararg?                (boolean conformed-var-arg)
-                            :expound-opts           expound-opts
+                            :humanize-opts          (if malli?
+                                                      (get (gr.cfg/get-env-config) :malli {})
+                                                      (get (gr.cfg/get-env-config) :expound {}))
                             :guardrails/validate-fn validate-fn
                             :guardrails/explain-fn  explain-fn
                             :guardrails/humanize-fn humanize-fn}
@@ -885,17 +887,20 @@
            arity               (key conformed-fn-tails)
            fn-name             (:name conformed-gdefn)
            docstring           (:docstring conformed-gdefn)
-           malli?              (:guardrails/malli? env)
+           {:guardrails/keys [malli? pre-proc]} env
            raw-meta-map        (merge
                                  (:meta conformed-gdefn)
                                  {::guardrails true})
            ;;; Assemble the config
            {max-checks-per-second :guardrails/mcps
-            :keys                 [defn-macro] :as config} (gr.cfg/merge-config env (meta fn-name) raw-meta-map)
+            :keys                 [defn-macro] :as config}
+           (gr.cfg/merge-config env (meta fn-name) raw-meta-map)
+
            add-throttling?     (number? max-checks-per-second)
-           defn-sym            (cond defn-macro (with-meta (symbol defn-macro) {:private private})
-                                     private 'defn-
-                                     :else 'defn)
+           defn-sym            (cond
+                                 defn-macro (with-meta (symbol defn-macro) {:private private})
+                                 private 'defn-
+                                 :else 'defn)
            ;;; Code generation
            external-fdef-body  (generate-external-fspec conformed-fn-tails malli?)
            fdef                (when external-fdef-body
@@ -904,11 +909,13 @@
                                    ;; Malli function schema to the metadata
                                    ;; below, there's probably no need to define
                                    ;; it here as well.
-                                   nil #_`(malli.core/=> ~fn-name [~@external-fdef-body])
+                                   (when (cljs-env? env)
+                                     `(malli.core/=> ~fn-name [~@external-fdef-body]))
                                    `(s/fdef ~fn-name ~@external-fdef-body)))
            meta-map            (merge
                                  raw-meta-map
-                                 (when malli? {:malli/schema `[~@external-fdef-body]})
+                                 (when (and malli? (not (cljs-env? env)))
+                                   {:malli/schema `[~@external-fdef-body]})
                                  (when-not malli? (generate-type-annotations env conformed-fn-tails)))
            processed-fn-bodies (let [process-cfg      {:env     env
                                                        :config  config
@@ -927,7 +934,11 @@
                                    ~'__gr_actual-calls (volatile! 0)]
                                  [])]
        `(let ~throttle-decls
-          ~@(remove nil? [fdef `(declare ~fn-name) main-defn])))))
+          ~@(remove nil?
+              [fdef
+               `(declare ~fn-name)
+               (when-not (cljs-env? env) pre-proc)
+               main-defn])))))
 
 #?(:clj
    ;;;; Main macros and public API
@@ -947,8 +958,9 @@
            async? (gr.cfg/async? cfg)]
        (cond
          (not cfg) (clean-defn 'defn body)
-         (#{:copilot :pro} mode) `(do (defn ~@body)
-                                      ~(gr.pro/>defn-impl env body opts))
+         (#{:copilot :pro} mode) `(do
+                                    (defn ~@body)
+                                    ~(gr.pro/>defn-impl env body opts))
          (#{:runtime :all} mode)
          (cond-> (remove nil? (generate-defn body private? (assoc env :form form :async-checks? async? :guardrails/malli? malli?)))
            (cljs-env? env) clj->cljs

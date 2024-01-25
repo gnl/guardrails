@@ -6,17 +6,26 @@
               [clojure.string :as string]
               [com.fulcrologic.guardrails.config :as gr.cfg]
               [com.fulcrologic.guardrails.impl.pro :as gr.pro]
+              [com.fulcrologic.guardrails.utils :as utils]
               [com.fulcrologic.guardrails.utils :refer [cljs-env? clj->cljs strip-colors]]])
+    [clojure.spec.alpha :as s]
     [com.fulcrologic.guardrails.core :as gr.core]
+    [malli.clj-kondo :as mc]
     [malli.core :as m]
     [malli.dev.pretty :as mp]
     [malli.error :as me]
+    [malli.instrument :as mi]
     [malli.registry]))
 
+
+;;; Operators ;;;
 
 (def => :ret)
 (def | :st)
 (def <- :gen)
+
+
+;;; Syntax specs
 
 (comment
   #?(:clj
@@ -54,13 +63,7 @@
        :list seq?)))
 
 
-(defn humanize-schema [malli-opts explain-data]
-  (with-out-str
-    ((mp/prettifier
-       ::m/explain
-       "Validation Error"
-       #(me/with-error-messages explain-data)
-       malli-opts))))
+;;; Schema definition helpers
 
 
 #?(:clj
@@ -68,6 +71,41 @@
      (cond-> `[:maybe ~@forms]
        (cljs-env? &env) clj->cljs)))
 
+
+(def ^:dynamic *coll-check-limit* s/*coll-check-limit*)
+
+#?(:clj
+   (defmacro every
+     ([schema]
+      `(every ~schema *coll-check-limit*))
+     ([schema sample-limit]
+      (cond-> `[:and coll? [:fn #(m/validate [:sequential ~schema] (take ~sample-limit %))]]
+        (cljs-env? &env) clj->cljs))))
+
+
+;;; Debounced clj-kondo config emission
+
+#?(:clj
+   (let [!linter-emit-future     (volatile! nil)
+         !linter-emit-namespaces (volatile! #{})
+         linter-emit-debounce    2000]
+     (defmacro bump-linter-cfg-emit! [nspace]
+       (when-let [futr @!linter-emit-future]
+         (future-cancel futr))
+       (vswap! !linter-emit-namespaces conj (-> nspace str symbol))
+       (vreset! !linter-emit-future
+         (future
+           (Thread/sleep linter-emit-debounce)
+           (utils/report-info "Emitting clj-kondo config...")
+           (doseq [nspace @!linter-emit-namespaces]
+             (utils/report-info nspace)
+             (mi/collect! {:ns nspace}))
+           (-> (mc/collect) mc/linter-config mc/save!)
+           (utils/report-info "...DONE.")))
+       nil)))
+
+
+;;; Main macros
 
 #?(:clj
    (defmacro >def [k v]
@@ -77,9 +115,14 @@
        (when (and cfg (#{:runtime :all} mode))
          `(register! ~k ~v)))))
 
-(defn default-validate [schema value] (m/validate schema value {:registry gr.reg/registry}))
-(defn default-explain [schema value] (malli.core/explain schema value {:registry gr.reg/registry}))
-(defn default-humanize [data opts] (humanize-schema (merge opts {:registry gr.reg/registry}) data))
+(defn validate [schema value] (m/validate schema value {:registry gr.reg/registry}))
+(defn explain [schema value] (malli.core/explain schema value {:registry gr.reg/registry}))
+(defn humanize-schema [data opts] (with-out-str
+                                    ((mp/prettifier
+                                       ::m/explain
+                                       "Validation Error"
+                                       #(me/with-error-messages data)
+                                       (merge opts {:registry gr.reg/registry})))))
 
 #?(:clj
    (do
@@ -89,9 +132,10 @@
        {:arglists '([name doc-string? attr-map? [params*] gspec prepost-map? body?]
                     [name doc-string? attr-map? ([params*] gspec prepost-map? body?) + attr-map?])}
        [& forms]
-       (let [env (merge &env `{:guardrails/validate-fn default-validate
-                               :guardrails/explain-fn  default-explain
-                               :guardrails/humanize-fn default-humanize})]
+       (let [env (merge &env `{:guardrails/validate-fn validate
+                               :guardrails/explain-fn  explain
+                               :guardrails/humanize-fn humanize-schema
+                               :guardrails/pre-proc    (bump-linter-cfg-emit! ~(utils/get-ns-name &env))})]
          (gr.core/>defn* env &form forms {:private? false :guardrails/malli? true})))
      (s/fdef >defn :args ::gr.core/>defn-args)))
 
@@ -104,9 +148,10 @@
        {:arglists '([name doc-string? attr-map? [params*] gspec prepost-map? body?]
                     [name doc-string? attr-map? ([params*] gspec prepost-map? body?) + attr-map?])}
        [& forms]
-       (let [env (merge &env `{:guardrails/validate-fn default-validate
-                               :guardrails/explain-fn  default-explain
-                               :guardrails/humanize-fn default-humanize})]
+       (let [env (merge &env `{:guardrails/validate-fn validate
+                               :guardrails/explain-fn  explain
+                               :guardrails/humanize-fn humanize-schema
+                               :guardrails/pre-proc    (bump-linter-cfg-emit! ~(utils/get-ns-name &env))})]
          (gr.core/>defn* env &form forms {:private? true :guardrails/malli? true})))
      (s/fdef >defn- :args ::gr.core/>defn-args)))
 
